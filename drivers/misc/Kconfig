@@ -621,6 +621,12 @@ config MARVELL_CN10K_DPI
 	  To compile this driver as a module, choose M here: the module
 	  will be called mrvl_cn10k_dpi.
 
+config SKB_INSPECTOR
+    tristate "SKB Debugging Lab Module"
+    default m
+    help
+      This is sk_buffer inspector.
+
 config MCHP_LAN966X_PCI
 	tristate "Microchip LAN966x PCIe Support"
 	depends on PCI
