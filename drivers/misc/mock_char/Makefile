@@ -1,0 +1,1 @@
+obj-m += mock_char.o
