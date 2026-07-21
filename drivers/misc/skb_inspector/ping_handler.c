@@ -1,8 +1,6 @@
-#include "linux/gfp_types.h"
-#include "linux/spinlock_types.h"
 #include <linux/types.h>
 #include <linux/spinlock.h>
-#include <linux/list.h>
+#include <linux/hashtable.h>
 #include <linux/slab.h>
 #include <linux/timekeeping.h>
 #include <linux/string.h>
@@ -24,12 +22,12 @@ static struct dentry *dbg_file;
 static struct socket *socket;
 static struct work_struct work;
 static atomic_t sequence = ATOMIC_INIT(5678);
-static DEFINE_SPINLOCK(send_req_lock);
-static LIST_HEAD(send_req);
+static DEFINE_SPINLOCK(req_table_lock);
+static DEFINE_HASHTABLE(req_table, 5);
 struct ping_req {
 	u16 seq;
 	ktime_t time;
-	struct list_head node;
+	struct hlist_node node;
 };
 
 static inline __be32 make_ipv4(u8 a, u8 b, u8 c, u8 d)
@@ -73,7 +71,7 @@ static int send_ping_package(void)
 	__be32 src_addr = make_ipv4(10, 0, 2, 15);
 	__be32 dst_addr = make_ipv4(10, 0, 2, 2);
 	struct icmphdr *icmph;
-	int req_seq = atomic_inc_return(&sequence);
+	u16 req_seq = atomic_inc_return(&sequence);
 	struct dst_entry *dst = get_ping_dst(src_addr, dst_addr);
 	struct ping_req *ping_req;
 
@@ -93,9 +91,9 @@ static int send_ping_package(void)
 	}
 	ping_req->seq = req_seq;
 	ping_req->time = ktime_get();
-	spin_lock(&send_req_lock);
-	list_add(&ping_req->node, &send_req);
-	spin_unlock(&send_req_lock);
+	spin_lock(&req_table_lock);
+	hash_add(req_table, &ping_req->node, ping_req->seq);
+	spin_unlock(&req_table_lock);
 
 	skb_dst_set(skb, dst);
 	skb_reserve(skb, LL_RESERVED_SPACE(dev));
@@ -152,15 +150,15 @@ static void ping_receiver(struct work_struct *work)
 
 		u16 res_seq = ntohs(icmph->un.echo.sequence);
 		ktime_t req_time = -1;
-		spin_lock(&send_req_lock);
-		list_for_each_entry(req, &send_req, node) {
+		spin_lock(&req_table_lock);
+		hash_for_each_possible(req_table, req, node, res_seq) {
 			if (req->seq == res_seq) {
 				req_time = req->time;
-				list_del(&req->node);
+				hash_del(&req->node);
 				break;
 			}
 		}
-		spin_unlock(&send_req_lock);
+		spin_unlock(&req_table_lock);
 
 		if (req_time != -1) {
 			kfree(req);
