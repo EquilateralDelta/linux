@@ -1,7 +1,11 @@
+#include <linux/inet.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/hashtable.h>
+#include <linux/workqueue.h>
+#include <linux/container_of.h>
 #include <linux/slab.h>
+#include <linux/jiffies.h>
 #include <linux/timekeeping.h>
 #include <linux/string.h>
 #include <linux/printk.h>
@@ -27,12 +31,14 @@ static DEFINE_HASHTABLE(req_table, 5);
 struct ping_req {
 	u16 seq;
 	ktime_t time;
+	__be32 dst_addr;
 	struct hlist_node node;
+	struct delayed_work work;
 };
 
-static inline __be32 make_ipv4(u8 a, u8 b, u8 c, u8 d)
+static inline __be32 make_ipv4(u8 addr[4])
 {
-	return htonl(((u32)a << 24) | ((u32)b << 16) | ((u32)c << 8) | d);
+	return htonl(((u32)addr[0] << 24) | ((u32)addr[1] << 16) | ((u32)addr[2] << 8) | addr[3]);
 }
 
 static __used noinline int dbg_skb_cloned(struct sk_buff *skb)
@@ -62,14 +68,34 @@ static struct dst_entry *get_ping_dst(__be32 src_addr, __be32 dst_addr)
 	return &rt->dst;
 }
 
-static int send_ping_package(void)
+static void expire_ping_request(struct work_struct *work)
+{
+	struct delayed_work *delayed_work = to_delayed_work(work);
+	struct ping_req *req =
+		container_of(delayed_work, struct ping_req, work);
+
+	spin_lock(&req_table_lock);
+	if (hlist_unhashed(&req->node)) {
+		spin_unlock(&req_table_lock);
+		return;
+	}
+
+	hash_del(&req->node);
+	spin_unlock(&req_table_lock);
+
+	pr_info("SKB inspector: missed ping with sequence number of %hu to %u\n",
+		req->seq, req->dst_addr);
+
+	kfree(req);
+}
+
+static int send_ping_package(__be32 dst_addr)
 {
 	struct sk_buff *skb;
 	char *data;
 	char *payload = "abcdef123456";
 	struct net_device *dev;
-	__be32 src_addr = make_ipv4(10, 0, 2, 15);
-	__be32 dst_addr = make_ipv4(10, 0, 2, 2);
+	__be32 src_addr = make_ipv4((u8[4]){10, 0, 2, 15});
 	struct icmphdr *icmph;
 	u16 req_seq = atomic_inc_return(&sequence);
 	struct dst_entry *dst = get_ping_dst(src_addr, dst_addr);
@@ -91,6 +117,9 @@ static int send_ping_package(void)
 	}
 	ping_req->seq = req_seq;
 	ping_req->time = ktime_get();
+	ping_req->dst_addr = dst_addr;
+	INIT_DELAYED_WORK(&ping_req->work, expire_ping_request);
+	schedule_delayed_work(&ping_req->work, msecs_to_jiffies(2000));
 	spin_lock(&req_table_lock);
 	hash_add(req_table, &ping_req->node, ping_req->seq);
 	spin_unlock(&req_table_lock);
@@ -124,7 +153,23 @@ err_skb:
 static ssize_t send_ping_write(struct file *f, const char __user *buf,
 			       size_t len, loff_t *ppos)
 {
-	send_ping_package();
+	char kbuf[32];
+	u8 addr_bytes[4];
+	if (len > 32) {
+		return -EMSGSIZE;
+	}
+	if (copy_from_user(kbuf, buf, len)) {
+		return -EFAULT;
+	}
+
+	int ret = in4_pton(kbuf, len, addr_bytes, '\n', NULL);
+	if (!ret) {
+		return -EINVAL;
+	}
+
+	__be32 dst_addr = make_ipv4(addr_bytes);
+
+	send_ping_package(dst_addr);
 	return len;
 }
 
@@ -161,11 +206,11 @@ static void ping_receiver(struct work_struct *work)
 		spin_unlock(&req_table_lock);
 
 		if (req_time != -1) {
+			cancel_delayed_work_sync(&req->work);
 			kfree(req);
 
 			pr_info("SKB inspector: received ping response with seq number %d, time elapsed %lld\n",
-				res_seq,
-				ktime_ms_delta(ktime_get(), req_time));
+				res_seq, ktime_ms_delta(ktime_get(), req_time));
 		} else {
 			pr_info("SKB inspector: received ping response with seq number %d, not found send time\n",
 				res_seq);
