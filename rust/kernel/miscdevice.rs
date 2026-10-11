@@ -42,11 +42,11 @@ pub struct MiscDeviceOptions {
 
 impl MiscDeviceOptions {
     /// Create a raw `struct miscdev` ready for registration.
-    pub const fn into_raw<T: MiscDevice>(self) -> bindings::miscdevice {
+    pub const fn into_raw<F: MiscDevice>(self) -> bindings::miscdevice {
         let mut result: bindings::miscdevice = pin_init::zeroed();
         result.minor = bindings::MISC_DYNAMIC_MINOR as ffi::c_int;
         result.name = crate::str::as_char_ptr_in_const_context(self.name);
-        result.fops = MiscdeviceVTable::<T>::build();
+        result.fops = MiscdeviceVTable::<F>::build();
         result
     }
 }
@@ -62,28 +62,30 @@ impl MiscDeviceOptions {
 /// - Deregistration occurs exactly once in [`Drop`] via `misc_deregister()`.
 /// - `inner` wraps a valid, pinned `miscdevice` created using
 ///   [`MiscDeviceOptions::into_raw`].
-#[repr(transparent)]
+#[repr(C)]
 #[pin_data(PinnedDrop)]
-pub struct MiscDeviceRegistration<T> {
+pub struct MiscDeviceRegistration<F: MiscDevice> {
     #[pin]
     inner: Opaque<bindings::miscdevice>,
-    _t: PhantomData<T>,
+    #[pin]
+    data: F::Data,
 }
 
 // SAFETY: It is allowed to call `misc_deregister` on a different thread from where you called
 // `misc_register`.
-unsafe impl<T> Send for MiscDeviceRegistration<T> {}
+unsafe impl<F> Send for MiscDeviceRegistration<F> where F: MiscDevice, F::Data: Send {}
 // SAFETY: All `&self` methods on this type are written to ensure that it is safe to call them in
 // parallel.
-unsafe impl<T> Sync for MiscDeviceRegistration<T> {}
+unsafe impl<F> Sync for MiscDeviceRegistration<F> where F: MiscDevice, F::Data: Sync {}
 
-impl<T: MiscDevice> MiscDeviceRegistration<T> {
+impl<F: MiscDevice> MiscDeviceRegistration<F> {
     /// Register a misc device.
-    pub fn register(opts: MiscDeviceOptions) -> impl PinInit<Self, Error> {
+    pub fn register<E>(opts: MiscDeviceOptions, data: impl PinInit<F::Data, E>) -> impl PinInit<Self, Error> where Error: From<E> {
         try_pin_init!(Self {
+            data <- data,
             inner <- Opaque::try_ffi_init(move |slot: *mut bindings::miscdevice| {
                 // SAFETY: The initializer can write to the provided `slot`.
-                unsafe { slot.write(opts.into_raw::<T>()) };
+                unsafe { slot.write(opts.into_raw::<F>()) };
 
                 // SAFETY: We just wrote the misc device options to the slot. The miscdevice will
                 // get unregistered before `slot` is deallocated because the memory is pinned and
@@ -91,8 +93,7 @@ impl<T: MiscDevice> MiscDeviceRegistration<T> {
                 // INVARIANT: If this returns `Ok(())`, then the `slot` will contain a registered
                 // misc device.
                 to_result(unsafe { bindings::misc_register(slot) })
-            }),
-            _t: PhantomData,
+            })
         })
     }
 
@@ -110,10 +111,15 @@ impl<T: MiscDevice> MiscDeviceRegistration<T> {
         // before the underlying `struct miscdevice` is destroyed.
         unsafe { Device::from_raw((*self.as_raw()).this_device) }
     }
+
+    /// Access the `data` field.
+    pub fn data(&self) -> &F::Data {
+        &self.data
+    }
 }
 
 #[pinned_drop]
-impl<T> PinnedDrop for MiscDeviceRegistration<T> {
+impl<F: MiscDevice> PinnedDrop for MiscDeviceRegistration<F> {
     fn drop(self: Pin<&mut Self>) {
         // SAFETY: We know that the device is registered by the type invariants.
         unsafe { bindings::misc_deregister(self.inner.get()) };
@@ -125,6 +131,8 @@ impl<T> PinnedDrop for MiscDeviceRegistration<T> {
 pub trait MiscDevice: Sized {
     /// What kind of pointer should `Self` be wrapped in.
     type Ptr: ForeignOwnable + Send + Sync;
+    /// Data associated with a device.
+    type Data: Sync + 'static;
 
     /// Called when the misc device is opened.
     ///
@@ -204,9 +212,9 @@ pub trait MiscDevice: Sized {
 }
 
 /// A vtable for the file operations of a Rust miscdevice.
-struct MiscdeviceVTable<T: MiscDevice>(PhantomData<T>);
+struct MiscdeviceVTable<F: MiscDevice>(PhantomData<F>);
 
-impl<T: MiscDevice> MiscdeviceVTable<T> {
+impl<F: MiscDevice> MiscdeviceVTable<F> {
     /// # Safety
     ///
     /// `file` and `inode` must be the file and inode for a file that is undergoing initialization.
@@ -225,14 +233,14 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // associated `struct miscdevice` before calling into this method. Furthermore,
         // `misc_open()` ensures that the miscdevice can't be unregistered and freed during this
         // call to `fops_open`.
-        let misc = unsafe { &*misc_ptr.cast::<MiscDeviceRegistration<T>>() };
+        let misc: &MiscDeviceRegistration<F> = unsafe { &*misc_ptr.cast::<MiscDeviceRegistration<F>>() };
 
         // SAFETY:
         // * This underlying file is valid for (much longer than) the duration of `T::open`.
         // * There is no active fdget_pos region on the file on this thread.
         let file = unsafe { File::from_raw_file(raw_file) };
 
-        let ptr = match T::open(file, misc) {
+        let ptr = match F::open(file, misc) {
             Ok(ptr) => ptr,
             Err(err) => return err.to_errno(),
         };
@@ -256,12 +264,12 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // SAFETY: The release call of a file owns the private data.
         let private = unsafe { (*file).private_data };
         // SAFETY: The release call of a file owns the private data.
-        let ptr = unsafe { <T::Ptr as ForeignOwnable>::from_foreign(private) };
+        let ptr = unsafe { <F::Ptr as ForeignOwnable>::from_foreign(private) };
 
         // SAFETY:
         // * The file is valid for the duration of this call.
         // * There is no active fdget_pos region on the file on this thread.
-        T::release(ptr, unsafe { File::from_raw_file(file) });
+        F::release(ptr, unsafe { File::from_raw_file(file) });
 
         0
     }
@@ -280,7 +288,7 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // SAFETY: This is a valid `struct iov_iter` for writing.
         let iov = unsafe { IovIterDest::from_raw(iter) };
 
-        match T::read_iter(kiocb, iov) {
+        match F::read_iter(kiocb, iov) {
             Ok(res) => res as isize,
             Err(err) => err.to_errno() as isize,
         }
@@ -300,7 +308,7 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // SAFETY: This is a valid `struct iov_iter` for reading.
         let iov = unsafe { IovIterSource::from_raw(iter) };
 
-        match T::write_iter(kiocb, iov) {
+        match F::write_iter(kiocb, iov) {
             Ok(res) => res as isize,
             Err(err) => err.to_errno() as isize,
         }
@@ -319,7 +327,7 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // SAFETY: This is a Rust Miscdevice, so we call `into_foreign` in `open` and
         // `from_foreign` in `release`, and `fops_mmap` is guaranteed to be called between those
         // two operations.
-        let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private.cast()) };
+        let device = unsafe { <F::Ptr as ForeignOwnable>::borrow(private.cast()) };
         // SAFETY: The caller provides a vma that is undergoing initial VMA setup.
         let area = unsafe { VmaNew::from_raw(vma) };
         // SAFETY:
@@ -327,7 +335,7 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // * There is no active fdget_pos region on the file on this thread.
         let file = unsafe { File::from_raw_file(file) };
 
-        match T::mmap(device, file, area) {
+        match F::mmap(device, file, area) {
             Ok(()) => 0,
             Err(err) => err.to_errno(),
         }
@@ -340,14 +348,14 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // SAFETY: The ioctl call of a file can access the private data.
         let private = unsafe { (*file).private_data };
         // SAFETY: Ioctl calls can borrow the private data of the file.
-        let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private) };
+        let device = unsafe { <F::Ptr as ForeignOwnable>::borrow(private) };
 
         // SAFETY:
         // * The file is valid for the duration of this call.
         // * There is no active fdget_pos region on the file on this thread.
         let file = unsafe { File::from_raw_file(file) };
 
-        match T::ioctl(device, file, cmd, arg) {
+        match F::ioctl(device, file, cmd, arg) {
             Ok(ret) => ret as c_long,
             Err(err) => err.to_errno() as c_long,
         }
@@ -365,14 +373,14 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // SAFETY: The compat ioctl call of a file can access the private data.
         let private = unsafe { (*file).private_data };
         // SAFETY: Ioctl calls can borrow the private data of the file.
-        let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private) };
+        let device = unsafe { <F::Ptr as ForeignOwnable>::borrow(private) };
 
         // SAFETY:
         // * The file is valid for the duration of this call.
         // * There is no active fdget_pos region on the file on this thread.
         let file = unsafe { File::from_raw_file(file) };
 
-        match T::compat_ioctl(device, file, cmd, arg) {
+        match F::compat_ioctl(device, file, cmd, arg) {
             Ok(ret) => ret as c_long,
             Err(err) => err.to_errno() as c_long,
         }
@@ -386,7 +394,7 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // SAFETY: The release call of a file owns the private data.
         let private = unsafe { (*file).private_data };
         // SAFETY: Ioctl calls can borrow the private data of the file.
-        let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private) };
+        let device = unsafe { <F::Ptr as ForeignOwnable>::borrow(private) };
         // SAFETY:
         // * The file is valid for the duration of this call.
         // * There is no active fdget_pos region on the file on this thread.
@@ -395,37 +403,37 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         // which this method is called.
         let m = unsafe { SeqFile::from_raw(seq_file) };
 
-        T::show_fdinfo(device, m, file);
+        F::show_fdinfo(device, m, file);
     }
 
     const VTABLE: bindings::file_operations = bindings::file_operations {
         open: Some(Self::open),
         release: Some(Self::release),
-        mmap: if T::HAS_MMAP { Some(Self::mmap) } else { None },
-        read_iter: if T::HAS_READ_ITER {
+        mmap: if F::HAS_MMAP { Some(Self::mmap) } else { None },
+        read_iter: if F::HAS_READ_ITER {
             Some(Self::read_iter)
         } else {
             None
         },
-        write_iter: if T::HAS_WRITE_ITER {
+        write_iter: if F::HAS_WRITE_ITER {
             Some(Self::write_iter)
         } else {
             None
         },
-        unlocked_ioctl: if T::HAS_IOCTL {
+        unlocked_ioctl: if F::HAS_IOCTL {
             Some(Self::ioctl)
         } else {
             None
         },
         #[cfg(CONFIG_COMPAT)]
-        compat_ioctl: if T::HAS_COMPAT_IOCTL {
+        compat_ioctl: if F::HAS_COMPAT_IOCTL {
             Some(Self::compat_ioctl)
-        } else if T::HAS_IOCTL {
+        } else if F::HAS_IOCTL {
             bindings::compat_ptr_ioctl
         } else {
             None
         },
-        show_fdinfo: if T::HAS_SHOW_FDINFO {
+        show_fdinfo: if F::HAS_SHOW_FDINFO {
             Some(Self::show_fdinfo)
         } else {
             None

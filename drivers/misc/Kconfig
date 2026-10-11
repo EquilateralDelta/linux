@@ -611,6 +611,12 @@ config MARVELL_CN10K_DPI
 	  To compile this driver as a module, choose M here: the module
 	  will be called mrvl_cn10k_dpi.
 
+config RUST_PLAYGROUND
+	tristate "Rust playground driver"
+	depends on RUST
+	help
+	  Rust playground driver
+
 config MCHP_LAN966X_PCI
 	tristate "Microchip LAN966x PCIe Support"
 	depends on PCI
