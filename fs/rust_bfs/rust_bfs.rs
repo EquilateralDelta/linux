@@ -15,7 +15,7 @@ use kernel::{
     types::Opaque,
     InPlaceModule,
 };
-use vfs::{Inode, SuperBlock};
+use vfs::{Inode, KStatFs, SuperBlock};
 
 mod vfs;
 
@@ -515,13 +515,33 @@ unsafe extern "C" fn bfs_read_folio(
     unsafe { bindings::block_read_full_folio(folio, Some(bfs_get_block)) }
 }
 
+unsafe extern "C" fn bfs_statfs(dentry: *mut bindings::dentry, buf: *mut bindings::kstatfs) -> i32
+{
+    let sb = unsafe { SuperBlock::from_raw((*dentry).d_sb) };
+    let info: &BfsSbInfo = unsafe { sb.s_fs_info() };
+    let buf = unsafe { KStatFs::from_raw(buf) };
+    let id = unsafe { sb.bdev_huge_dev() };
+
+    buf.set_f_type(BFS_MAGIC as isize);
+    buf.set_f_bsize(sb.s_blocksize() as isize);
+    buf.set_f_blocks(info.total_blocks as u64);
+    buf.set_f_bfree(info.free_blocks as u64);
+    buf.set_f_bavail(info.free_blocks as u64);
+    buf.set_f_files((info.last_inode + 1 - BFS_ROOT_INO) as u64);
+    buf.set_f_ffree(info.free_inodes as u64);
+    buf.set_f_fsid(id);
+    buf.set_f_namelen(BFS_NAMELEN as isize);
+
+    0
+}
+
 const BFS_SOPS: bindings::super_operations = bindings::super_operations {
     alloc_inode: Some(bfs_alloc_inode),
     free_inode: Some(bfs_free_inode),
     // .write_inode	= bfs_write_inode,
     // .evict_inode	= bfs_evict_inode,
     put_super: Some(bfs_put_super),
-    // .statfs		= bfs_statfs,
+    statfs: Some(bfs_statfs),
     ..pin_init::zeroed()
 };
 

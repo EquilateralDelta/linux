@@ -132,4 +132,74 @@ impl SuperBlock {
     pub(crate) fn set_s_time_max(&self, value: i64) {
         unsafe { (*self.as_raw()).s_time_max = value }
     }
+
+    pub(crate) fn s_blocksize(&self) -> usize {
+        unsafe { (*self.as_raw()).s_blocksize }
+    }
+
+    /// # Safety
+    ///
+    /// The superblock must be backed by a block device (`s_bdev` non-null).
+    pub(crate) unsafe fn bdev_huge_dev(&self) -> u64 {
+        let dev = unsafe { (*(*self.as_raw()).s_bdev).bd_dev };
+        let major = dev >> bindings::MINORBITS;
+        let minor = dev & ((1 << bindings::MINORBITS) - 1);
+        ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
+    }
+}
+
+#[repr(transparent)]
+pub(crate) struct KStatFs(Opaque<bindings::kstatfs>);
+
+impl KStatFs {
+    pub(crate) fn as_raw(&self) -> *mut bindings::kstatfs {
+        self.0.get()
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must be valid and not accessed by anyone else for the lifetime `'a`.
+    pub(crate) unsafe fn from_raw<'a>(ptr: *mut bindings::kstatfs) -> &'a KStatFs {
+        unsafe { &*ptr.cast() }
+    }
+
+    pub(crate) fn set_f_type(&self, value: isize) {
+        unsafe { (*self.as_raw()).f_type = value }
+    }
+
+    pub(crate) fn set_f_bsize(&self, value: isize) {
+        unsafe { (*self.as_raw()).f_bsize = value }
+    }
+
+    pub(crate) fn set_f_blocks(&self, value: u64) {
+        unsafe { (*self.as_raw()).f_blocks = value }
+    }
+
+    pub(crate) fn set_f_bfree(&self, value: u64) {
+        unsafe { (*self.as_raw()).f_bfree = value }
+    }
+
+    pub(crate) fn set_f_bavail(&self, value: u64) {
+        unsafe { (*self.as_raw()).f_bavail = value }
+    }
+
+    pub(crate) fn set_f_files(&self, value: u64) {
+        unsafe { (*self.as_raw()).f_files = value }
+    }
+
+    pub(crate) fn set_f_ffree(&self, value: u64) {
+        unsafe { (*self.as_raw()).f_ffree = value }
+    }
+
+    pub(crate) fn set_f_fsid(&self, value: u64) {
+        unsafe {
+            (*self.as_raw()).f_fsid = bindings::__kernel_fsid_t {
+                val: [value as i32, (value >> 32) as i32],
+            }
+        }
+    }
+
+    pub(crate) fn set_f_namelen(&self, value: isize) {
+        unsafe { (*self.as_raw()).f_namelen = value }
+    }
 }
