@@ -4,17 +4,21 @@
 
 #![allow(dead_code)]
 
-use core::ops::Deref;
+// TODO refactor to remote some of AS conversions
+
+use core::ops::{Deref, Range};
 
 use kernel::bitmap::BitmapVec;
 use kernel::error::{from_result, to_result};
-use kernel::prelude::*;
+use kernel::sync::Mutex;
+use kernel::types::ForeignOwnable;
 use kernel::{
     bindings,
     error::{code, Error, Result},
     types::Opaque,
     InPlaceModule,
 };
+use kernel::{new_mutex, prelude::*};
 use vfs::{Inode, KStatFs, SuperBlock};
 
 mod vfs;
@@ -56,6 +60,7 @@ unsafe impl Send for RustBfs {}
 // kernel-side.
 unsafe impl Sync for RustBfs {}
 
+#[pin_data]
 struct BfsSbInfo {
     total_blocks: u32,
     free_blocks: u32,
@@ -63,7 +68,8 @@ struct BfsSbInfo {
     end_block: u32,
     last_inode: u32,
     inodes_bitmap: BitmapVec,
-    // struct mutex bfs_lock;
+    #[pin]
+    bfs_lock: Mutex<()>,
 }
 
 struct BfsInodeInfo {
@@ -88,8 +94,27 @@ impl BufferHead {
         }
     }
 
+    fn read_header_block(sb: &SuperBlock) -> Result<Self> {
+        Self::read(sb, 0)
+    }
+
+    // SAFETY: block shouldn't me modified for the duration of the slice lifetime
     unsafe fn data(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts((*self.0).b_data, (*self.0).b_size) }
+    }
+
+    // SAFETY: slice shouldn't me modified for the duration of the slice lifetime
+    unsafe fn data_slice(&self, range: Range<usize>) -> &[u8] {
+        unsafe {
+            core::slice::from_raw_parts((*self.0).b_data.wrapping_add(range.start), range.len())
+        }
+    }
+
+    // SAFETY: slice should have exclusive access to the data of the block for the slice lifetime, usually through bfs_lock mutex
+    unsafe fn data_slice_mut(&self, range: Range<usize>) -> &mut [u8] {
+        unsafe {
+            core::slice::from_raw_parts_mut((*self.0).b_data.wrapping_add(range.start), range.len())
+        }
     }
 }
 
@@ -114,6 +139,20 @@ fn take_u16(buf: &mut &[u8]) -> u16 {
     u16::from_le_bytes(take_n_bytes(buf))
 }
 
+fn write_n_bytes<const N: usize>(buf: &mut &mut [u8], value: [u8; N]) {
+    let dest = &mut buf[..N];
+    dest.copy_from_slice(&value);
+    *buf = &mut core::mem::take(buf)[N..];
+}
+
+fn write_u32(buf: &mut &mut [u8], value: u32) {
+    write_n_bytes(buf, value.to_le_bytes());
+}
+
+fn write_u16(buf: &mut &mut [u8], value: u16) {
+    write_n_bytes(buf, value.to_le_bytes());
+}
+
 struct BfsSuperBlock {
     magic: u32,
     start: u32,
@@ -123,6 +162,12 @@ struct BfsSuperBlock {
 }
 
 impl BfsSuperBlock {
+    fn read(sb: &SuperBlock) -> Result<Self> {
+        let bh = BufferHead::read_header_block(sb)?;
+        let res = Self::parse(unsafe { bh.data() });
+        Ok(res)
+    }
+
     fn parse(mut slice: &[u8]) -> Self {
         debug_assert_eq!(slice.len(), BFS_BSIZE as usize);
         let reader = &mut slice;
@@ -152,14 +197,9 @@ struct BfsInode {
 }
 
 impl BfsInode {
-    fn parse(slice: &[u8], offset: u32) -> Self {
-        debug_assert_eq!(slice.len(), BFS_BSIZE as usize);
-        debug_assert!(offset < BFS_INODES_PER_BLOCK);
-        let mut subslice = slice
-            .chunks_exact(BFS_INODE_SIZE as usize)
-            .nth(offset as usize)
-            .unwrap();
-        let reader = &mut subslice;
+    fn parse(mut slice: &[u8]) -> Self {
+        debug_assert_eq!(slice.len(), BFS_INODE_SIZE as usize);
+        let reader = &mut slice;
         Self {
             ino: {
                 let res = take_u16(reader);
@@ -195,6 +235,63 @@ impl BfsInode {
             self.eoffset + 1 - self.sblock * BFS_BSIZE
         }
     }
+
+    fn serialize(&self, mut slice: &mut [u8]) {
+        debug_assert_eq!(slice.len(), BFS_INODE_SIZE as usize);
+        let writer = &mut slice;
+
+        write_u16(writer, self.ino);
+        write_u16(writer, 0);
+        write_u32(writer, self.sblock);
+        write_u32(writer, self.eblock);
+        write_u32(writer, self.eoffset);
+        write_u32(writer, self.vtype);
+        write_u32(writer, self.mode);
+        write_u32(writer, self.uid);
+        write_u32(writer, self.gid);
+        write_u32(writer, self.nlink);
+        write_u32(writer, self.atime);
+        write_u32(writer, self.mtime);
+        write_u32(writer, self.ctime);
+    }
+
+    fn inode_block(ino: u16) -> u64 {
+        1 + (ino - BFS_ROOT_INO as u16) as u64 / BFS_INODES_PER_BLOCK as u64
+    }
+
+    fn inode_block_range(ino: u16) -> Range<usize> {
+        let idx: usize = (ino - BFS_ROOT_INO as u16) as usize % BFS_INODES_PER_BLOCK as usize;
+        idx * (BFS_INODE_SIZE as usize)..(idx + 1) * (BFS_INODE_SIZE as usize)
+    }
+
+    fn inode_validate(sb: &SuperBlock, ino: u16) -> Result<()> {
+        let sb_info: &BfsSbInfo = unsafe { sb.s_fs_info() };
+        if (ino < BFS_ROOT_INO as u16) || (ino > sb_info.last_inode as u16) {
+            Err(code::EINVAL)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read(sb: &SuperBlock, ino: u16) -> Result<Self> {
+        Self::inode_validate(sb, ino)?;
+
+        let bh = BufferHead::read(sb, Self::inode_block(ino))?;
+        let slice = unsafe { bh.data_slice(Self::inode_block_range(ino)) };
+        Ok(Self::parse(slice))
+    }
+
+    fn write(&self, sb: &SuperBlock) -> Result<BufferHead> {
+        let ino = self.ino;
+        Self::inode_validate(sb, ino)?;
+
+        let bh = BufferHead::read(sb, Self::inode_block(ino))?;
+        let slice = unsafe { bh.data_slice_mut(Self::inode_block_range(ino)) };
+        self.serialize(slice);
+        unsafe { bindings::mark_buffer_dirty(bh.0) };
+
+        Ok(bh)
+    }
 }
 
 struct BfsDirent {
@@ -222,7 +319,6 @@ impl BfsDirent {
 unsafe extern "C" fn bfs_put_super(sb: *mut bindings::super_block) {
     let sb = unsafe { SuperBlock::from_raw(sb) };
     free_sb_info(sb);
-    // mutex_destroy(&info->bfs_lock);
 }
 
 unsafe extern "C" fn bfs_readdir(f: *mut bindings::file, ctx: *mut bindings::dir_context) -> i32 {
@@ -236,7 +332,11 @@ unsafe extern "C" fn bfs_readdir(f: *mut bindings::file, ctx: *mut bindings::dir
 
     let mut iter = DirIterator::new(dir);
     iter.pos = ctx.pos as u32;
-    for di in iter.by_ref().filter_map(Result::ok).filter(|di| di.ino != 0) {
+    for di in iter
+        .by_ref()
+        .filter_map(Result::ok)
+        .filter(|di| di.ino != 0)
+    {
         if unsafe {
             !bindings::dir_emit(
                 ctx,
@@ -318,7 +418,7 @@ impl<'a> Iterator for DirIterator<'a> {
             Err(e) => {
                 self.pos += BFS_BSIZE - offset;
                 return Some(Err(e));
-            },
+            }
         };
         let data = unsafe { block.data() };
 
@@ -353,7 +453,7 @@ unsafe extern "C" fn bfs_lookup(
 
     let inode = match found_ino {
         None => core::ptr::null_mut(),
-        Some(ino) => match bfs_iget(dir.sb(), ino as u32) {
+        Some(ino) => match bfs_iget(dir.sb(), ino) {
             Ok(inode) => inode,
             Err(e) => e.to_ptr(),
         },
@@ -414,40 +514,81 @@ unsafe extern "C" fn bfs_free_inode(inode: *mut bindings::inode) {
     };
 }
 
+unsafe extern "C" fn bfs_write_inode(
+    inode: *mut bindings::inode,
+    wbc: *mut bindings::writeback_control,
+) -> i32 {
+    let inode = unsafe { Inode::from_raw(inode) };
+    from_result(|| _bfs_write_inode(inode, wbc))
+}
+
+fn _bfs_write_inode(inode: &Inode, wbc: *mut bindings::writeback_control) -> Result<i32> {
+    let ino = inode.i_ino() as u16;
+    let bi = inode_to_bfs_inode(inode);
+
+    let sb_info: &BfsSbInfo = unsafe { inode.sb().s_fs_info() };
+    let lock = sb_info.bfs_lock.lock();
+
+    let bfs_inode = BfsInode {
+        ino,
+        sblock: bi.sblock as u32,
+        eblock: bi.eblock as u32,
+        eoffset: (bi.sblock * BFS_BSIZE as u64 + inode.i_size() as u64 - 1) as u32,
+        vtype: if ino == BFS_ROOT_INO as u16 {
+            BFS_VDIR
+        } else {
+            BFS_VREG
+        },
+        mode: inode.i_mode() as u32,
+        uid: inode.uid(),
+        gid: inode.gid(),
+        nlink: inode.nlink(),
+        atime: inode.atime_sec() as u32,
+        mtime: inode.mtime_sec() as u32,
+        ctime: inode.ctime_sec() as u32,
+    };
+    let bh = bfs_inode.write(inode.sb())?;
+
+    if unsafe { (*wbc).sync_mode } == bindings::writeback_sync_modes_WB_SYNC_ALL {
+        unsafe { bindings::sync_dirty_buffer(bh.0) };
+        if unsafe { bindings::buffer_req(bh.0) != 0 && bindings::buffer_uptodate(bh.0) == 0 } {
+            return Err(code::EIO);
+        }
+    }
+
+    drop(lock);
+    Ok(0)
+}
+
 unsafe extern "C" fn bfs_get_block(
     inode: *mut bindings::inode,
     block: u64,
     bh_result: *mut bindings::buffer_head,
     create: i32,
 ) -> i32 {
-    // 	unsigned long phys;
-    // 	int err;
-    // 	struct super_block *sb = inode->i_sb;
-    // 	struct bfs_sb_info *info = BFS_SB(sb);
-    // 	struct bfs_inode_info *bi = BFS_I(inode);
     let inode = unsafe { Inode::from_raw(inode) };
+    let sb = inode.sb();
     let bi = inode_to_bfs_inode(inode);
     let phys = bi.sblock + block;
     if create == 0 {
         if phys <= bi.eblock {
             unsafe {
-                bindings::map_bh(bh_result, inode.sb().as_raw(), phys);
+                bindings::map_bh(bh_result, sb.as_raw(), phys);
             }
         }
         return 0;
     }
 
-    code::EINVAL.to_errno()
-    // 	/*
-    // 	 * If the file is not empty and the requested block is within the
-    // 	 * range of blocks allocated for this file, we can grant it.
-    // 	 */
-    // 	if (bi->i_sblock && (phys <= bi->i_eblock)) {
-    // 		dprintf("c=%d, b=%08lx, phys=%08lx (interim block granted)\n",
-    // 				create, (unsigned long)block, phys);
-    // 		map_bh(bh_result, sb, phys);
-    // 		return 0;
-    // 	}
+    /*
+     * If the file is not empty and the requested block is within the
+     * range of blocks allocated for this file, we can grant it.
+     */
+    if bi.sblock > 0 && (phys <= bi.eblock) {
+        unsafe { bindings::map_bh(bh_result, sb.as_raw(), phys) };
+        return 0;
+    }
+
+    code::ENOSPC.to_errno()
 
     // 	/* The file will be extended, so let's see if there is enough space. */
     // 	if (phys >= info->si_blocks)
@@ -515,8 +656,40 @@ unsafe extern "C" fn bfs_read_folio(
     unsafe { bindings::block_read_full_folio(folio, Some(bfs_get_block)) }
 }
 
-unsafe extern "C" fn bfs_statfs(dentry: *mut bindings::dentry, buf: *mut bindings::kstatfs) -> i32
-{
+fn bfs_write_failed(mapping: *mut bindings::address_space, to: i64) {
+    let inode = unsafe { (*mapping).host };
+    let isize = unsafe { Inode::from_raw(inode).i_size() };
+
+    if to > isize {
+        unsafe { bindings::truncate_pagecache(inode, isize) };
+    }
+}
+
+unsafe extern "C" fn bfs_write_begin(
+    _iocb: *const bindings::kiocb,
+    mapping: *mut bindings::address_space,
+    pos: i64,
+    len: u32,
+    foliop: *mut *mut bindings::folio,
+    _fsdata: *mut *mut core::ffi::c_void,
+) -> i32 {
+    let ret =
+        unsafe { bindings::block_write_begin(mapping, pos, len, foliop, Some(bfs_get_block)) };
+    if ret != 0 {
+        bfs_write_failed(mapping, pos + len as i64);
+    }
+
+    ret
+}
+
+unsafe extern "C" fn bfs_writepages(
+    mapping: *mut bindings::address_space,
+    wbc: *mut bindings::writeback_control,
+) -> i32 {
+    unsafe { bindings::mpage_writepages(mapping, wbc, Some(bfs_get_block)) }
+}
+
+unsafe extern "C" fn bfs_statfs(dentry: *mut bindings::dentry, buf: *mut bindings::kstatfs) -> i32 {
     let sb = unsafe { SuperBlock::from_raw((*dentry).d_sb) };
     let info: &BfsSbInfo = unsafe { sb.s_fs_info() };
     let buf = unsafe { KStatFs::from_raw(buf) };
@@ -538,7 +711,7 @@ unsafe extern "C" fn bfs_statfs(dentry: *mut bindings::dentry, buf: *mut binding
 const BFS_SOPS: bindings::super_operations = bindings::super_operations {
     alloc_inode: Some(bfs_alloc_inode),
     free_inode: Some(bfs_free_inode),
-    // .write_inode	= bfs_write_inode,
+    write_inode: Some(bfs_write_inode),
     // .evict_inode	= bfs_evict_inode,
     put_super: Some(bfs_put_super),
     statfs: Some(bfs_statfs),
@@ -576,12 +749,12 @@ const BFS_FILE_OPERATIONS: bindings::file_operations = bindings::file_operations
 };
 
 const BFS_AOPS: bindings::address_space_operations = bindings::address_space_operations {
-    // .dirty_folio	= block_dirty_folio,
-    // .invalidate_folio = block_invalidate_folio,
+    dirty_folio: Some(bindings::block_dirty_folio),
+    invalidate_folio: Some(bindings::block_invalidate_folio),
     read_folio: Some(bfs_read_folio),
-    // .writepages	= bfs_writepages,
-    // .write_begin	= bfs_write_begin,
-    // .write_end	= generic_write_end,
+    writepages: Some(bfs_writepages),
+    write_begin: Some(bfs_write_begin),
+    write_end: Some(bindings::generic_write_end),
     // .migrate_folio	= buffer_migrate_folio,
     // .bmap		= bfs_bmap,
     ..pin_init::zeroed()
@@ -593,7 +766,7 @@ struct LockedInode<'a> {
 }
 
 impl<'a> LockedInode<'a> {
-    unsafe fn get(sb: &SuperBlock, ino: u32) -> Result<Self> {
+    unsafe fn get(sb: &SuperBlock, ino: u16) -> Result<Self> {
         let inode = unsafe { bindings::iget_locked(sb.as_raw(), ino as u64) };
         if inode.is_null() {
             return Err(code::ENOMEM);
@@ -635,24 +808,13 @@ impl<'a> Drop for LockedInode<'a> {
     }
 }
 
-fn bfs_iget(sb: &SuperBlock, ino: u32) -> Result<*mut bindings::inode> {
+fn bfs_iget(sb: &SuperBlock, ino: u16) -> Result<*mut bindings::inode> {
     let inode = unsafe { LockedInode::get(sb, ino)? };
     if !inode.locked {
         return Ok(inode.take());
     }
 
-    let sb_info: &BfsSbInfo = unsafe { sb.s_fs_info() };
-
-    if !(BFS_ROOT_INO..=sb_info.last_inode).contains(&ino) {
-        return Err(code::EIO);
-    }
-
-    let block = (ino - BFS_ROOT_INO) / BFS_INODES_PER_BLOCK + 1;
-    let block = BufferHead::read(sb, block as u64)?;
-    let block = unsafe { block.data() };
-    let offset = (ino - BFS_ROOT_INO) % BFS_INODES_PER_BLOCK;
-    let di = BfsInode::parse(block, offset);
-
+    let di = BfsInode::read(sb, ino).map_err(|_| code::EIO)?;
     inode.set_i_mode(0x00000FFF & di.mode as u16);
     if di.vtype == BFS_VDIR {
         inode.set_i_mode(inode.i_mode() | bindings::S_IFDIR as u16);
@@ -694,31 +856,18 @@ fn free_sb_info(sb: &SuperBlock) {
 
     unsafe {
         (*sb.as_raw()).s_fs_info = core::ptr::null_mut() as *mut c_void;
-        KBox::from_raw(info);
+        let _info = <Pin<KBox<BfsSbInfo>> as ForeignOwnable>::from_foreign(info);
     }
 }
 
 fn _bfs_fill_super(sb: &SuperBlock, _fc: *mut bindings::fs_context) -> Result<i32> {
-    let mut info = KBox::new(
-        BfsSbInfo {
-            total_blocks: 0,
-            free_blocks: 0,
-            free_inodes: 0,
-            end_block: 0,
-            last_inode: 0,
-            inodes_bitmap: BitmapVec::new(BFS_MAX_LASTI as usize + 1, GFP_KERNEL)?,
-        },
-        GFP_KERNEL,
-    )?;
-
     unsafe {
         if bindings::sb_set_blocksize(sb.as_raw(), BFS_BSIZE as i32) == 0 {
             return Err(code::EINVAL);
         }
     }
 
-    let sb_header_block = BufferHead::read(sb, 0)?;
-    let sb_header = BfsSuperBlock::parse(unsafe { sb_header_block.data() });
+    let sb_header = BfsSuperBlock::read(sb)?;
     if sb_header.magic != BFS_MAGIC {
         return Err(code::EINVAL);
     }
@@ -727,30 +876,31 @@ fn _bfs_fill_super(sb: &SuperBlock, _fc: *mut bindings::fs_context) -> Result<i3
         return Err(code::EINVAL);
     }
 
-    info.last_inode = (sb_header.start - BFS_BSIZE) / BFS_INODE_SIZE + BFS_ROOT_INO - 1;
-    if info.last_inode > BFS_MAX_LASTI {
+    let last_inode = (sb_header.start - BFS_BSIZE) / BFS_INODE_SIZE + BFS_ROOT_INO - 1;
+    if last_inode > BFS_MAX_LASTI {
         return Err(code::EINVAL);
     }
-    info.total_blocks = (sb_header.end + 1) >> BFS_BSIZE_BITS;
-    info.free_blocks = (sb_header.end + 1 - sb_header.start) >> BFS_BSIZE_BITS;
+    let total_blocks = (sb_header.end + 1) >> BFS_BSIZE_BITS;
+    let mut free_blocks = (sb_header.end + 1 - sb_header.start) >> BFS_BSIZE_BITS;
+    let mut free_inodes = 0;
+    let mut inodes_bitmap = BitmapVec::new(BFS_MAX_LASTI as usize + 1, GFP_KERNEL)?;
+    let mut end_block = 0;
 
-    BufferHead::read(sb, info.total_blocks as u64 - 1).map_err(|_| code::EIO)?;
+    BufferHead::read(sb, total_blocks as u64 - 1).map_err(|_| code::EIO)?;
 
     let mut stored_inode_bh = None;
-    for inum in BFS_ROOT_INO..=info.last_inode {
-        let block = (inum - BFS_ROOT_INO) / BFS_INODES_PER_BLOCK + 1;
-        let offset = (inum - BFS_ROOT_INO) % BFS_INODES_PER_BLOCK;
-
-        if stored_inode_bh.is_none() || offset == 0 {
-            let bh = BufferHead::read(sb, block.into())?;
+    for ino in BFS_ROOT_INO as u16..=last_inode as u16 {
+        let ino_range = BfsInode::inode_block_range(ino);
+        if stored_inode_bh.is_none() || ino_range.start == 0 {
+            let bh = BufferHead::read(sb, BfsInode::inode_block(ino))?;
             stored_inode_bh = Some(bh);
         };
         let bh = stored_inode_bh.as_ref().unwrap();
 
-        let data = unsafe { bh.data() };
-        let inode = BfsInode::parse(data, offset);
+        let data = unsafe { bh.data_slice(ino_range) };
+        let inode = BfsInode::parse(data);
 
-        if inode.eblock > info.total_blocks
+        if inode.eblock > total_blocks
             || inode.sblock > inode.eblock
             || (inode.eoffset != u32::MAX && inode.eoffset > sb_header.end)
             || inode.sblock * BFS_BSIZE > inode.eoffset
@@ -759,19 +909,32 @@ fn _bfs_fill_super(sb: &SuperBlock, _fc: *mut bindings::fs_context) -> Result<i3
         }
 
         if inode.ino == 0 {
-            info.free_inodes += 1;
+            free_inodes += 1;
             continue;
         }
 
-        info.inodes_bitmap.set_bit(inum as usize);
-        info.free_blocks -= inode.blocks_taken();
-        info.end_block = info.end_block.max(inode.eblock);
+        inodes_bitmap.set_bit(ino as usize);
+        free_blocks -= inode.blocks_taken();
+        end_block = end_block.max(inode.eblock);
     }
+
+    let info = KBox::pin_init(
+        try_pin_init!(BfsSbInfo {
+            total_blocks,
+            free_blocks,
+            free_inodes,
+            end_block,
+            last_inode,
+            inodes_bitmap,
+            bfs_lock <- new_mutex!(())
+        }),
+        GFP_KERNEL,
+    )?;
 
     unsafe { sb.set_s_fs_info(info) };
     sb.set_s_op(&BFS_SOPS);
 
-    let inode = bfs_iget(sb, BFS_ROOT_INO).inspect_err(|_| free_sb_info(sb))?;
+    let inode = bfs_iget(sb, BFS_ROOT_INO as u16).inspect_err(|_| free_sb_info(sb))?;
     let root_dentry = unsafe { bindings::d_make_root(inode) };
     if root_dentry.is_null() {
         free_sb_info(sb);

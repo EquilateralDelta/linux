@@ -1,5 +1,6 @@
 use kernel::bindings;
 use kernel::prelude::*;
+use kernel::types::ForeignOwnable;
 use kernel::types::Opaque;
 use pin_init::MaybeZeroable;
 
@@ -18,6 +19,10 @@ impl Inode {
 
     pub(crate) fn sb(&self) -> &SuperBlock {
         unsafe { SuperBlock::from_raw((*self.as_raw()).i_sb) }
+    }
+
+    pub(crate) fn i_ino(&self) -> u64 {
+        unsafe { (*self.as_raw()).i_ino }
     }
 
     pub(crate) fn i_mode(&self) -> u16 {
@@ -60,24 +65,48 @@ impl Inode {
         unsafe { (*self.as_raw()).i_blocks = value }
     }
 
+    pub(crate) fn uid(&self) -> u32 {
+        unsafe { bindings::i_uid_read(self.as_raw()) }
+    }
+
     pub(crate) fn set_uid(&self, value: u32) {
         unsafe { bindings::i_uid_write(self.as_raw(), value) }
+    }
+
+    pub(crate) fn gid(&self) -> u32 {
+        unsafe { bindings::i_gid_read(self.as_raw()) }
     }
 
     pub(crate) fn set_gid(&self, value: u32) {
         unsafe { bindings::i_gid_write(self.as_raw(), value) }
     }
 
+    pub(crate) fn nlink(&self) -> u32 {
+        unsafe { (*self.as_raw()).__bindgen_anon_1.i_nlink }
+    }
+
     pub(crate) fn set_nlink(&self, value: u32) {
         unsafe { bindings::set_nlink(self.as_raw(), value) }
+    }
+
+    pub(crate) fn atime_sec(&self) -> i64 {
+        unsafe { bindings::inode_get_atime_sec(self.as_raw()) }
     }
 
     pub(crate) fn set_atime(&self, sec: i64, nsec: isize) {
         unsafe { bindings::inode_set_atime(self.as_raw(), sec, nsec) };
     }
 
+    pub(crate) fn mtime_sec(&self) -> i64 {
+        unsafe { bindings::inode_get_mtime_sec(self.as_raw()) }
+    }
+
     pub(crate) fn set_mtime(&self, sec: i64, nsec: isize) {
         unsafe { bindings::inode_set_mtime(self.as_raw(), sec, nsec) };
+    }
+
+    pub(crate) fn ctime_sec(&self) -> i64 {
+        unsafe { bindings::inode_get_ctime_sec(self.as_raw()) }
     }
 
     pub(crate) fn set_ctime(&self, sec: i64, nsec: isize) {
@@ -109,8 +138,8 @@ impl SuperBlock {
     ///
     /// Must be called at most once per superblock, before any call to [`SuperBlock::s_fs_info`]
     /// and while no one else can access the superblock (e.g. in `fill_super`).
-    pub(crate) unsafe fn set_s_fs_info<T>(&self, value: KBox<T>) {
-        unsafe { (*self.as_raw()).s_fs_info = KBox::into_raw(value).cast() }
+    pub(crate) unsafe fn set_s_fs_info<T>(&self, value: Pin<KBox<T>>) {
+        unsafe { (*self.as_raw()).s_fs_info = value.into_foreign() }
     }
 
     pub(crate) fn set_s_op(&self, value: *const bindings::super_operations) {

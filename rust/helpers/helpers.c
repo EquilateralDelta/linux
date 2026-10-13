@@ -101,3 +101,4 @@
 #include "workqueue.c"
 #include "xarray.c"
 #include "buffer_head.c"
+#include "mpage.c"
