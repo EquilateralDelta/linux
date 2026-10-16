@@ -65,6 +65,10 @@ impl Inode {
         unsafe { (*self.as_raw()).i_blocks = value }
     }
 
+    pub(crate) fn mark_dirty(&self) {
+        unsafe { bindings::mark_inode_dirty(self.as_raw()) }
+    }
+
     pub(crate) fn uid(&self) -> u32 {
         unsafe { bindings::i_uid_read(self.as_raw()) }
     }

@@ -110,16 +110,19 @@ impl From<Ino> for usize {
     }
 }
 
-#[pin_data]
-struct BfsSbInfo {
-    total_blocks: u32,
+struct BfsAlloc {
     free_blocks: u32,
     free_inodes: u32,
     end_block: u32,
-    last_inode: Ino,
     inodes_bitmap: BitmapVec,
+}
+
+#[pin_data]
+struct BfsSbInfo {
+    total_blocks: u32,
+    last_inode: Ino,
     #[pin]
-    bfs_lock: Mutex<()>,
+    alloc: Mutex<BfsAlloc>,
 }
 
 struct BfsInodeInfo {
@@ -143,6 +146,26 @@ impl BufferHead {
         }
     }
 
+    /// Gets the buffer for `block` without reading it from disk.
+    fn get(sb: &SuperBlock, block: u32) -> Result<Self> {
+        let res = unsafe { bindings::sb_getblk(sb.as_raw(), u64::from(block)) };
+
+        if res.is_null() {
+            Err(code::ENOMEM)
+        } else {
+            Ok(Self(res))
+        }
+    }
+
+    fn mark_dirty(&self) {
+        unsafe { bindings::mark_buffer_dirty(self.0) };
+    }
+
+    fn forget(self) {
+        let this = core::mem::ManuallyDrop::new(self);
+        unsafe { bindings::bforget(this.0) };
+    }
+
     fn read_header_block(sb: &SuperBlock) -> Result<Self> {
         Self::read(sb, 0)
     }
@@ -159,7 +182,7 @@ impl BufferHead {
         }
     }
 
-    // SAFETY: slice should have exclusive access to the data of the block for the slice lifetime, usually through bfs_lock mutex
+    // SAFETY: slice should have exclusive access to the data of the block for the slice lifetime, usually through the `alloc` mutex
     unsafe fn data_slice_mut(&self, range: Range<usize>) -> &mut [u8] {
         unsafe {
             core::slice::from_raw_parts_mut((*self.0).b_data.wrapping_add(range.start), range.len())
@@ -558,7 +581,7 @@ fn _bfs_write_inode(inode: &Inode, wbc: *mut bindings::writeback_control) -> Res
     let bi = inode_to_bfs_inode(inode);
 
     let sb_info: &BfsSbInfo = unsafe { inode.sb().s_fs_info() };
-    let lock = sb_info.bfs_lock.lock();
+    let lock = sb_info.alloc.lock();
 
     let bfs_inode = BfsInode {
         ino,
@@ -591,6 +614,30 @@ fn _bfs_write_inode(inode: &Inode, wbc: *mut bindings::writeback_control) -> Res
     Ok(0)
 }
 
+fn bfs_move_block(from: u32, to: u32, sb: &SuperBlock) -> Result<()> {
+    let bh = BufferHead::read(sb, from)?;
+    let new = BufferHead::get(sb, to)?;
+
+    // SAFETY: both buffers are block-sized; caller holds `BfsSbInfo::alloc`, so no one else
+    // touches the file's data blocks.
+    unsafe {
+        let src = bh.data();
+        new.data_slice_mut(0..src.len()).copy_from_slice(src);
+    }
+    new.mark_dirty();
+    bh.forget();
+    // `new` is released by Drop.
+    Ok(())
+}
+
+fn bfs_move_blocks(sb: &SuperBlock, start: u32, end: u32, to: u32) -> Result<()> {
+    for i in start..=end {
+        bfs_move_block(i, to + i, sb)?;
+    }
+
+    Ok(())
+}
+
 unsafe extern "C" fn bfs_get_block(
     inode: *mut bindings::inode,
     block: u64,
@@ -598,88 +645,88 @@ unsafe extern "C" fn bfs_get_block(
     create: i32,
 ) -> i32 {
     let inode = unsafe { Inode::from_raw(inode) };
+    from_result(|| _bfs_get_block(inode, block, bh_result, create != 0))
+}
+
+fn _bfs_get_block(
+    inode: &Inode,
+    block: u64,
+    bh_result: *mut bindings::buffer_head,
+    create: bool,
+) -> Result<i32> {
     let sb = inode.sb();
-    let bi = inode_to_bfs_inode(inode);
-    let phys = block.saturating_add(u64::from(bi.sblock));
-    if create == 0 {
-        if bi.sblock != 0 && phys <= u64::from(bi.eblock) {
-            unsafe {
-                bindings::map_bh(bh_result, sb.as_raw(), phys);
-            }
-        }
-        return 0;
-    }
-
-    /*
-     * If the file is not empty and the requested block is within the
-     * range of blocks allocated for this file, we can grant it.
-     */
-    if bi.sblock > 0 && (phys <= u64::from(bi.eblock)) {
-        unsafe { bindings::map_bh(bh_result, sb.as_raw(), phys) };
-        return 0;
-    }
-
     let info: &BfsSbInfo = unsafe { sb.s_fs_info() };
-    // 	/* The file will be extended, so let's see if there is enough space. */
-    if phys >= u64::from(info.total_blocks) {
-        return code::ENOSPC.to_errno();
+    let map = |phys: u32| unsafe { bindings::map_bh(bh_result, sb.as_raw(), u64::from(phys)) };
+
+    let bi = inode_to_bfs_inode(inode);
+
+    // Doesn't fit in `u32` => certainly past the end of the device.
+    let block = u32::try_from(block).map_err(|_| code::ENOSPC)?;
+    let phys = block.checked_add(bi.sblock).ok_or(code::ENOSPC)?;
+
+    // If the file is not empty and the requested block is within the
+    // range of blocks allocated for this file, we can grant it.
+    if bi.sblock != 0 && phys <= bi.eblock {
+        map(phys);
+        return Ok(0);
+    }
+    if !create {
+        return Ok(0);
     }
 
-    code::ENOSPC.to_errno()
+    // The rest has to be protected against itself.
+    let mut alloc = info.alloc.lock();
+    // SAFETY: `sblock`/`eblock` are only modified under `alloc`, which we hold.
+    let bi = unsafe { inode_to_bfs_inode_mut(inode) };
 
-    // 	/* The rest has to be protected against itself. */
-    // 	mutex_lock(&info->bfs_lock);
+    // The file will be extended, so let's see if there is enough space.
+    if phys >= info.total_blocks {
+        return Err(code::ENOSPC);
+    }
 
-    // 	/*
-    // 	 * If the last data block for this file is the last allocated
-    // 	 * block, we can extend the file trivially, without moving it
-    // 	 * anywhere.
-    // 	 */
-    // 	if (bi->i_eblock == info->si_lf_eblk) {
-    // 		dprintf("c=%d, b=%08lx, phys=%08lx (simple extension)\n",
-    // 				create, (unsigned long)block, phys);
-    // 		map_bh(bh_result, sb, phys);
-    // 		info->si_freeb -= phys - bi->i_eblock;
-    // 		info->si_lf_eblk = bi->i_eblock = phys;
-    // 		mark_inode_dirty(inode);
-    // 		err = 0;
-    // 		goto out;
-    // 	}
+    // If the last data block for this file is the last allocated
+    // block, we can extend the file trivially, without moving it
+    // anywhere. (C lacks the `sblock != 0` check: an empty file on an
+    // empty fs would map block `block`, i.e. the superblock/inode table.)
+    if bi.sblock != 0 && bi.eblock == alloc.end_block {
+        alloc.free_blocks = alloc
+            .free_blocks
+            .checked_sub(phys - bi.eblock)
+            .ok_or(code::ENOSPC)?;
+        alloc.end_block = phys;
+        bi.eblock = phys;
+        inode.mark_dirty();
+        map(phys);
+        return Ok(0);
+    }
 
-    // 	/* Ok, we have to move this entire file to the next free block. */
-    // 	phys = info->si_lf_eblk + 1;
-    // 	if (phys + block >= info->si_blocks) {
-    // 		err = -ENOSPC;
-    // 		goto out;
-    // 	}
+    // Ok, we have to move this entire file to the next free block.
+    let new_sblock = alloc.end_block.checked_add(1).ok_or(code::ENOSPC)?;
+    let new_eblock = new_sblock
+        .checked_add(block)
+        .filter(|&e| e < info.total_blocks)
+        .ok_or(code::ENOSPC)?;
 
-    // 	if (bi->i_sblock) {
-    // 		err = bfs_move_blocks(inode->i_sb, bi->i_sblock,
-    // 						bi->i_eblock, phys);
-    // 		if (err) {
-    // 			dprintf("failed to move ino=%08lx -> fs corruption\n",
-    // 								inode->i_ino);
-    // 			goto out;
-    // 		}
-    // 	} else
-    // 		err = 0;
+    let old_blocks = if bi.sblock != 0 {
+        bfs_move_blocks(sb, bi.sblock, bi.eblock, new_sblock)?;
+        bi.eblock - bi.sblock + 1
+    } else {
+        0
+    };
 
-    // 	dprintf("c=%d, b=%08lx, phys=%08lx (moved)\n",
-    //                 create, (unsigned long)block, phys);
-    // 	bi->i_sblock = phys;
-    // 	phys += block;
-    // 	info->si_lf_eblk = bi->i_eblock = phys;
+    // C uses `inode->i_blocks` as the old size (and notes it's racy, XXX);
+    // the old range we just moved is the exact value.
+    alloc.free_blocks = alloc
+        .free_blocks
+        .checked_sub(new_eblock - new_sblock + 1 - old_blocks)
+        .ok_or(code::ENOSPC)?;
+    alloc.end_block = new_eblock;
+    bi.sblock = new_sblock;
+    bi.eblock = new_eblock;
+    inode.mark_dirty();
+    map(new_eblock);
 
-    // 	/*
-    // 	 * This assumes nothing can write the inode back while we are here
-    // 	 * and thus update inode->i_blocks! (XXX)
-    // 	 */
-    // 	info->si_freeb -= bi->i_eblock - bi->i_sblock + 1 - inode->i_blocks;
-    // 	mark_inode_dirty(inode);
-    // 	map_bh(bh_result, sb, phys);
-    // out:
-    // 	mutex_unlock(&info->bfs_lock);
-    // 	return err;
+    Ok(0)
 }
 
 unsafe extern "C" fn bfs_read_folio(
@@ -715,6 +762,10 @@ unsafe extern "C" fn bfs_write_begin(
     ret
 }
 
+unsafe extern "C" fn bfs_bmap(mapping: *mut bindings::address_space, block: u64) -> u64 {
+    unsafe { bindings::generic_block_bmap(mapping, block, Some(bfs_get_block)) }
+}
+
 unsafe extern "C" fn bfs_writepages(
     mapping: *mut bindings::address_space,
     wbc: *mut bindings::writeback_control,
@@ -725,16 +776,17 @@ unsafe extern "C" fn bfs_writepages(
 unsafe extern "C" fn bfs_statfs(dentry: *mut bindings::dentry, buf: *mut bindings::kstatfs) -> i32 {
     let sb = unsafe { SuperBlock::from_raw((*dentry).d_sb) };
     let info: &BfsSbInfo = unsafe { sb.s_fs_info() };
+    let alloc = info.alloc.lock();
     let buf = unsafe { KStatFs::from_raw(buf) };
     let id = unsafe { sb.bdev_huge_dev() };
 
     buf.set_f_type(BFS_MAGIC as isize);
     buf.set_f_bsize(sb.s_blocksize() as isize);
     buf.set_f_blocks(info.total_blocks as u64);
-    buf.set_f_bfree(info.free_blocks as u64);
-    buf.set_f_bavail(info.free_blocks as u64);
+    buf.set_f_bfree(u64::from(alloc.free_blocks));
+    buf.set_f_bavail(u64::from(alloc.free_blocks));
     buf.set_f_files(u64::from(info.last_inode) + 1 - u64::from(Ino::ROOT));
-    buf.set_f_ffree(info.free_inodes as u64);
+    buf.set_f_ffree(u64::from(alloc.free_inodes));
     buf.set_f_fsid(id);
     buf.set_f_namelen(BFS_NAMELEN as isize);
 
@@ -788,8 +840,8 @@ const BFS_AOPS: bindings::address_space_operations = bindings::address_space_ope
     writepages: Some(bfs_writepages),
     write_begin: Some(bfs_write_begin),
     write_end: Some(bindings::generic_write_end),
-    // .migrate_folio	= buffer_migrate_folio,
-    // .bmap		= bfs_bmap,
+    migrate_folio: Some(bindings::buffer_migrate_folio),
+    bmap: Some(bfs_bmap),
     ..pin_init::zeroed()
 };
 
@@ -949,19 +1001,22 @@ fn _bfs_fill_super(sb: &SuperBlock, _fc: *mut bindings::fs_context) -> Result<i3
         }
 
         inodes_bitmap.set_bit(ino.into());
-        free_blocks = free_blocks.checked_sub(inode.blocks_taken()).ok_or(code::EIO)?;
+        free_blocks = free_blocks
+            .checked_sub(inode.blocks_taken())
+            .ok_or(code::EIO)?;
         end_block = end_block.max(inode.eblock);
     }
 
     let info = KBox::pin_init(
         try_pin_init!(BfsSbInfo {
             total_blocks,
-            free_blocks,
-            free_inodes,
-            end_block,
             last_inode,
-            inodes_bitmap,
-            bfs_lock <- new_mutex!(())
+            alloc <- new_mutex!(BfsAlloc {
+                free_blocks,
+                free_inodes,
+                end_block,
+                inodes_bitmap,
+            }),
         }),
         GFP_KERNEL,
     )?;

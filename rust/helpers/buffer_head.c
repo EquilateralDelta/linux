@@ -27,3 +27,14 @@ __rust_helper int rust_helper_buffer_uptodate(const struct buffer_head *bh)
 {
     return buffer_uptodate(bh);
 }
+
+__rust_helper struct buffer_head *rust_helper_sb_getblk(struct super_block *sb,
+                                                          sector_t block)
+{
+    return sb_getblk(sb, block);
+}
+
+__rust_helper void rust_helper_bforget(struct buffer_head *bh)
+{
+    bforget(bh);
+}
