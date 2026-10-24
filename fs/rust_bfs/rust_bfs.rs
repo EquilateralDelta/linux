@@ -19,6 +19,7 @@ use kernel::{
     InPlaceModule,
 };
 use kernel::{new_mutex, prelude::*};
+use pin_init::MaybeZeroable;
 use vfs::{Inode, KStatFs, SuperBlock};
 
 mod vfs;
@@ -58,7 +59,7 @@ unsafe impl Send for RustBfs {}
 // kernel-side.
 unsafe impl Sync for RustBfs {}
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, MaybeZeroable)]
 struct Ino(u16);
 
 impl Ino {
@@ -129,7 +130,7 @@ struct BfsInodeInfo {
     dsk_ino: Ino,
     sblock: u32,
     eblock: u32,
-    // struct mapping_metadata_bhs i_metadata_bhs;
+    metadata_bhs: Opaque<bindings::mapping_metadata_bhs>,
     vfs_inode: Inode,
 }
 
@@ -253,6 +254,7 @@ impl BfsSuperBlock {
     }
 }
 
+#[derive(MaybeZeroable)]
 struct BfsInode {
     ino: Ino,
     sblock: u32,
@@ -342,9 +344,19 @@ impl BfsInode {
         let bh = BufferHead::read(sb, ino.block())?;
         let slice = unsafe { bh.data_slice_mut(ino.block_range()) };
         self.serialize(slice);
-        unsafe { bindings::mark_buffer_dirty(bh.0) };
+        bh.mark_dirty();
 
         Ok(bh)
+    }
+
+    fn clear(sb: &SuperBlock, ino: Ino) -> Result<()> {
+        ino.validate(sb)?;
+
+        let bh = BufferHead::read(sb, ino.block())?;
+        let slice = unsafe { bh.data_slice_mut(ino.block_range()) };
+        slice.fill(0);
+        bh.mark_dirty();
+        Ok(())
     }
 }
 
@@ -367,6 +379,14 @@ impl BfsDirent {
 
     fn namelen(&self) -> usize {
         self.name.iter().take_while(|&&x| x != b'\0').count()
+    }
+
+    fn serialize(&self, mut slice: &mut [u8]) {
+        debug_assert_eq!(slice.len(), BFS_DIRENT_SIZE as usize);
+        let writer = &mut slice;
+
+        write_u16(writer, self.ino.num());
+        write_n_bytes(writer, self.name);
     }
 }
 
@@ -409,6 +429,25 @@ unsafe extern "C" fn bfs_readdir(f: *mut bindings::file, ctx: *mut bindings::dir
     0
 }
 
+unsafe extern "C" fn bfs_fsync(
+    file: *mut bindings::file,
+    start: i64,
+    end: i64,
+    datasync: i32,
+) -> i32 {
+    let inode = unsafe { Inode::from_raw((*(*file).f_mapping).host) };
+    let bfs_inode = inode_to_bfs_inode(inode);
+    unsafe {
+        bindings::mmb_fsync(
+            file,
+            bfs_inode.metadata_bhs.get(),
+            start,
+            end,
+            datasync != 0,
+        )
+    }
+}
+
 // SAFETY: the returned slice lifetime shouldn't overlap with modification code to qstr
 unsafe fn qstr_to_slice_checked<'a>(qstr: *const bindings::qstr, max_len: u32) -> Result<&'a [u8]> {
     unsafe {
@@ -440,6 +479,38 @@ impl<'a> DirIterator<'a> {
             sb: inode.sb(),
             cached_buffer_head: None,
         }
+    }
+
+    fn with_all_slots(inode: &'a Inode) -> Self {
+        let bfs_inode = inode_to_bfs_inode(inode);
+        let size = if bfs_inode.sblock == 0 {
+            0
+        } else {
+            (bfs_inode.eblock - bfs_inode.sblock + 1) * BFS_BSIZE
+        };
+
+        Self {
+            size,
+            ..Self::new(inode)
+        }
+    }
+
+    fn last_pos(&self) -> Option<u32> {
+        self.pos.checked_sub(BFS_DIRENT_SIZE)
+    }
+
+    fn last_bh(&self) -> Option<&BufferHead> {
+        let block = self.sblock + (self.last_pos()? >> BFS_BSIZE_BITS);
+        match &self.cached_buffer_head {
+            Some((b, bh)) if *b == block => Some(bh),
+            _ => None,
+        }
+    }
+
+    unsafe fn last_slot_mut(&self) -> Option<&mut [u8]> {
+        let offset = (self.last_pos()? & (BFS_BSIZE - 1)) as usize;
+        let bh = self.last_bh()?;
+        Some(unsafe { bh.data_slice_mut(offset..offset + BFS_DIRENT_SIZE as usize) })
     }
 
     fn get_buffer_head(&mut self, block: u32) -> Result<&BufferHead, DiskReadError> {
@@ -483,6 +554,113 @@ impl<'a> Iterator for DirIterator<'a> {
     }
 }
 
+unsafe extern "C" fn bfs_create(
+    idmap: *mut bindings::mnt_idmap,
+    dir: *mut bindings::inode,
+    dentry: *mut bindings::dentry,
+    mode: u16,
+    excl: bool,
+) -> i32 {
+    let dir = unsafe { Inode::from_raw(dir) };
+    from_result(|| _bfs_create(idmap, dir, dentry, mode, excl))
+}
+
+fn _bfs_create(
+    _idmap: *mut bindings::mnt_idmap,
+    dir: &Inode,
+    dentry: *mut bindings::dentry,
+    mode: u16,
+    _excl: bool,
+) -> Result<i32> {
+    let inode = dir.sb().new_inode()?;
+    let info: &BfsSbInfo = unsafe { inode.sb().s_fs_info() };
+    let mut alloc = info.alloc.lock();
+
+    let ino = alloc
+        .inodes_bitmap
+        .next_zero_bit(0)
+        .map(|ino| Ino(ino as u16))
+        .filter(|ino| *ino <= info.last_inode);
+    let ino = match ino {
+        Some(ino) => ino,
+        None => {
+            drop(alloc);
+            unsafe { inode.iput() };
+            return Err(code::ENOSPC);
+        }
+    };
+
+    alloc.inodes_bitmap.set_bit(ino.into());
+    alloc.free_inodes -= 1;
+    unsafe {
+        bindings::inode_init_owner(
+            core::ptr::addr_of_mut!(bindings::nop_mnt_idmap),
+            inode.as_raw(),
+            dir.as_raw(),
+            mode,
+        );
+        bindings::simple_inode_init_ts(inode.as_raw());
+    }
+
+    inode.set_i_blocks(0);
+    inode.set_i_op(&BFS_FILE_INOPS);
+    inode.set_i_fop(&BFS_FILE_OPERATIONS);
+    inode.set_mapping_ops(&BFS_AOPS);
+    inode.set_i_ino(ino.into());
+
+    let bfs_inode = unsafe { inode_to_bfs_inode_mut(inode) };
+    bfs_inode.dsk_ino = ino;
+    bfs_inode.sblock = 0;
+    bfs_inode.eblock = 0;
+    inode.insert_hash();
+    inode.mark_dirty();
+
+    let add_res = bfs_add_entry(
+        dir,
+        unsafe { core::ptr::addr_of!((*dentry).__bindgen_anon_1.d_name) },
+        ino,
+    );
+    if let Err(e) = add_res {
+        inode.dec_link_count();
+        drop(alloc);
+        unsafe { inode.iput() };
+        return Err(e);
+    }
+
+    unsafe { bindings::d_instantiate(dentry, inode.as_raw()) };
+    Ok(0)
+}
+
+fn bfs_add_entry(dir: &Inode, child: *const bindings::qstr, ino: Ino) -> Result<()> {
+    let mut iter = DirIterator::with_all_slots(dir);
+    let name = unsafe { qstr_to_slice_checked(child, BFS_NAMELEN)? };
+    let mut de = iter
+        .by_ref()
+        .find(|r| r.as_ref().map_or(true, |de| de.ino.is_unused()))
+        .ok_or(code::ENOSPC)?
+        .map_err(|_| code::EIO)?;
+
+    let iter_size = i64::from(iter.last_pos().unwrap() + BFS_DIRENT_SIZE);
+    if iter_size > dir.i_size() {
+        dir.set_i_size(iter_size);
+        dir.set_ctime_current();
+    }
+
+    dir.set_mtime_to_ts(dir.set_ctime_current());
+    dir.mark_dirty();
+    de.ino = ino;
+    de.name = [0; BFS_NAMELEN as usize];
+    de.name[..name.len()].copy_from_slice(name);
+    de.serialize(unsafe { iter.last_slot_mut().unwrap() });
+
+    let bfs_dir = inode_to_bfs_inode(dir);
+    unsafe {
+        bindings::mmb_mark_buffer_dirty(iter.last_bh().unwrap().0, bfs_dir.metadata_bhs.get());
+    }
+
+    Ok(())
+}
+
 unsafe extern "C" fn bfs_lookup(
     dir: *mut bindings::inode,
     dentry: *mut bindings::dentry,
@@ -522,6 +700,7 @@ unsafe extern "C" fn bfs_alloc_inode(_sb: *mut bindings::super_block) -> *mut bi
             dsk_ino: Ino::UNUSED,
             sblock: 0,
             eblock: 0,
+            metadata_bhs: pin_init::zeroed(),
             vfs_inode: pin_init::zeroed(),
         },
         GFP_KERNEL,
@@ -529,11 +708,11 @@ unsafe extern "C" fn bfs_alloc_inode(_sb: *mut bindings::super_block) -> *mut bi
 
     match inode_info {
         Ok(inode_info) => {
-            // mmb_init(&bi->i_metadata_bhs, &bi->vfs_inode.i_data);
             let inode = inode_info.vfs_inode.as_raw();
 
             unsafe {
                 bindings::inode_init_once(inode);
+                bindings::mmb_init(inode_info.metadata_bhs.get(), inode_info.vfs_inode.i_data());
             }
             Box::into_raw(inode_info);
             inode
@@ -612,6 +791,46 @@ fn _bfs_write_inode(inode: &Inode, wbc: *mut bindings::writeback_control) -> Res
 
     drop(lock);
     Ok(0)
+}
+
+unsafe extern "C" fn bfs_evict_inode(inode: *mut bindings::inode) {
+    let inode = unsafe { Inode::from_raw(inode) };
+    let ino = Ino::from_inode(inode);
+    let bfs_inode = inode_to_bfs_inode(inode);
+    unsafe { bindings::truncate_inode_pages_final(inode.i_data()) };
+    if inode.nlink() != 0 {
+        unsafe { bindings::mmb_sync(bfs_inode.metadata_bhs.get()) };
+    }
+    unsafe { bindings::mmb_invalidate(bfs_inode.metadata_bhs.get()) };
+    unsafe { bindings::clear_inode(inode.as_raw()) };
+
+    if inode.nlink() != 0 {
+        return;
+    }
+
+    let sb_info: &BfsSbInfo = unsafe { inode.sb().s_fs_info() };
+    let mut alloc = sb_info.alloc.lock();
+    let clear_res = BfsInode::clear(inode.sb(), ino);
+    if clear_res.is_err() {
+        return;
+    }
+
+    if !bfs_inode.dsk_ino.is_unused() {
+        if bfs_inode.sblock != 0 {
+            alloc.free_blocks += bfs_inode.eblock + 1 - bfs_inode.sblock;
+        }
+        alloc.free_inodes += 1;
+        alloc.inodes_bitmap.clear_bit(ino.into());
+    }
+
+    /*
+     * If this was the last file, make the previous block
+     * "last block of the last file" even if there is no
+     * real file there, saves us 1 gap.
+     */
+    if alloc.end_block == bfs_inode.eblock && bfs_inode.sblock != 0 {
+        alloc.end_block = bfs_inode.sblock - 1;
+    }
 }
 
 fn bfs_move_block(from: u32, to: u32, sb: &SuperBlock) -> Result<()> {
@@ -797,14 +1016,14 @@ const BFS_SOPS: bindings::super_operations = bindings::super_operations {
     alloc_inode: Some(bfs_alloc_inode),
     free_inode: Some(bfs_free_inode),
     write_inode: Some(bfs_write_inode),
-    // .evict_inode	= bfs_evict_inode,
+    evict_inode: Some(bfs_evict_inode),
     put_super: Some(bfs_put_super),
     statfs: Some(bfs_statfs),
     ..pin_init::zeroed()
 };
 
 const BFS_DIR_INOPS: bindings::inode_operations = bindings::inode_operations {
-    // .create			= bfs_create,
+    create: Some(bfs_create),
     lookup: Some(bfs_lookup),
     // .link			= bfs_link,
     // .unlink			= bfs_unlink,
@@ -815,7 +1034,7 @@ const BFS_DIR_INOPS: bindings::inode_operations = bindings::inode_operations {
 const BFS_DIR_OPERATIONS: bindings::file_operations = bindings::file_operations {
     read: Some(bindings::generic_read_dir),
     iterate_shared: Some(bfs_readdir),
-    // .fsync		= bfs_fsync,
+    fsync: Some(bfs_fsync),
     llseek: Some(bindings::generic_file_llseek),
     ..pin_init::zeroed()
 };
@@ -973,6 +1192,10 @@ fn _bfs_fill_super(sb: &SuperBlock, _fc: *mut bindings::fs_context) -> Result<i3
     let mut inodes_bitmap = BitmapVec::new(usize::from(Ino::MAX) + 1, GFP_KERNEL)?;
     let mut end_block = 0;
 
+    for i in 0..Ino::ROOT.into() {
+        inodes_bitmap.set_bit(i);
+    }
+
     BufferHead::read(sb, total_blocks - 1)?;
 
     let mut stored_inode_bh = None;
@@ -1074,7 +1297,7 @@ impl InPlaceModule for RustBfs {
                 unsafe { slot.write(fst) };
 
                 to_result(unsafe { bindings::register_filesystem(slot) })
-            }),
+            })
         })
     }
 }

@@ -74,6 +74,22 @@ __rust_helper void rust_helper_mark_inode_dirty(struct inode *inode)
 	mark_inode_dirty(inode);
 }
 
+__rust_helper void rust_helper_insert_inode_hash(struct inode *inode)
+{
+	insert_inode_hash(inode);
+}
+
+__rust_helper struct timespec64 rust_helper_inode_set_mtime_to_ts(struct inode *inode,
+						struct timespec64 ts)
+{
+	return inode_set_mtime_to_ts(inode, ts);
+}
+
+__rust_helper void rust_helper_inode_dec_link_count(struct inode *inode)
+{
+	inode_dec_link_count(inode);
+}
+
 __rust_helper bool rust_helper_dir_emit(struct dir_context *ctx,
 			    const char *name, int namelen,
 			    u64 ino, unsigned type)

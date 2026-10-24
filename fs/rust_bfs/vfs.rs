@@ -2,6 +2,7 @@ use kernel::bindings;
 use kernel::prelude::*;
 use kernel::types::ForeignOwnable;
 use kernel::types::Opaque;
+use kernel::error::code;
 use pin_init::MaybeZeroable;
 
 #[derive(MaybeZeroable)]
@@ -23,6 +24,10 @@ impl Inode {
 
     pub(crate) fn i_ino(&self) -> u64 {
         unsafe { (*self.as_raw()).i_ino }
+    }
+
+    pub(crate) fn set_i_ino(&self, value: u64) {
+        unsafe { (*self.as_raw()).i_ino = value }
     }
 
     pub(crate) fn i_mode(&self) -> u16 {
@@ -49,6 +54,10 @@ impl Inode {
         }
     }
 
+    pub(crate) fn i_data(&self) -> *mut bindings::address_space {
+        unsafe { core::ptr::addr_of_mut!((*self.as_raw()).i_data) }
+    }
+
     pub(crate) fn i_size(&self) -> i64 {
         unsafe { (*self.as_raw()).i_size }
     }
@@ -67,6 +76,18 @@ impl Inode {
 
     pub(crate) fn mark_dirty(&self) {
         unsafe { bindings::mark_inode_dirty(self.as_raw()) }
+    }
+
+    pub(crate) fn insert_hash(&self) {
+        unsafe { bindings::insert_inode_hash(self.as_raw()) }
+    }
+
+    pub(crate) fn dec_link_count(&self) {
+        unsafe { bindings::inode_dec_link_count(self.as_raw()) }
+    }
+
+    pub(crate) unsafe fn iput(&self) {
+        unsafe { bindings::iput(self.as_raw()) }
     }
 
     pub(crate) fn uid(&self) -> u32 {
@@ -115,6 +136,14 @@ impl Inode {
 
     pub(crate) fn set_ctime(&self, sec: i64, nsec: isize) {
         unsafe { bindings::inode_set_ctime(self.as_raw(), sec, nsec) };
+    }
+
+    pub(crate) fn set_ctime_current(&self) -> bindings::timespec64 {
+        unsafe { bindings::inode_set_ctime_current(self.as_raw()) }
+    }
+
+    pub(crate) fn set_mtime_to_ts(&self, ts: bindings::timespec64) -> bindings::timespec64 {
+        unsafe { bindings::inode_set_mtime_to_ts(self.as_raw(), ts) }
     }
 }
 
@@ -178,6 +207,15 @@ impl SuperBlock {
         let major = dev >> bindings::MINORBITS;
         let minor = dev & ((1 << bindings::MINORBITS) - 1);
         ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
+    }
+
+    pub(crate) fn new_inode(&self) -> Result<&Inode> {
+        let inode = unsafe { bindings::new_inode(self.as_raw()) };
+        if inode.is_null() {
+            Err(code::ENOMEM)
+        } else {
+            Ok(unsafe { Inode::from_raw(inode) })
+        }
     }
 }
 
